@@ -6,7 +6,6 @@ import os, sys, json, ssl
 import http.client
 from urllib.parse import urlsplit
 
-
 #支持的AI服务商列表，models里面的第一项请设置为默认要使用的model
 #rpm(requests per minute)是针对免费用户的，如果是付费用户，一般会高很多，可以自己修改
 #大语言模型发展迅速，估计没多久这些数据会全部过时
@@ -26,7 +25,8 @@ AI_LIST = {
         {'name': 'claude-3', 'rpm': 5, 'context': 200000},
         {'name': 'claude-2.1', 'rpm': 5, 'context': 100000},],},
     'xai': {'host': 'https://api.x.ai', 'models': [
-        {'name': 'grok-beta', 'rpm': 60, 'context': 128000},],},
+        {'name': 'grok-beta', 'rpm': 60, 'context': 128000},
+        {'name': 'grok-2', 'rpm': 60, 'context': 128000},],},
     'mistral': {'host': 'https://api.mistral.ai', 'models': [
         {'name': 'open-mistral-7b', 'rpm': 60, 'context': 32000},
         {'name': 'mistral-small-latest', 'rpm': 60, 'context': 32000},
@@ -72,10 +72,10 @@ class SimpleAiProvider:
         self.name = name
         self.apiKey = apiKey
         self.singleTurn = singleTurn
-        self.models = AI_LIST[name]['models']
+        self._models = AI_LIST[name]['models']
         
         #如果传入的model不在列表中，默认使用第一个
-        item = next((m for m in self.models if m['name'] == model), self.models[0])
+        item = next((m for m in self._models if m['name'] == model), self._models[0])
         self.model = item['name']
         self.rpm = item['rpm']
         self.context_size = item['context']
@@ -129,7 +129,7 @@ class SimpleAiProvider:
         self.connPools[index][1] = conn
 
     #发起一个网络请求，返回json数据
-    def post(self, path, payload, headers, toJson=True) -> dict:
+    def _send(self, path, payload, headers, toJson=True, method='POST') -> dict:
         #print(f'payload={payload}')
         #print(f'headers={headers}')
         retried = 0
@@ -137,9 +137,12 @@ class SimpleAiProvider:
             try:
                 index, host, conn = self.nextConnection() #(index, host_tuple, conn_obj)
                 self.host = host.netloc
-                #拼接路径
+                #拼接路径，避免一些边界条件出错
                 url = '/' + host.path.strip('/') + (('?' + host.query) if host.query else '') + path.lstrip('/')
-                conn.request('POST', url, json.dumps(payload), headers)
+                if method == 'POST':
+                    conn.request('POST', url, json.dumps(payload), headers)
+                else:
+                    conn.request('GET', url, headers=headers)
                 resp = conn.getresponse()
                 body = resp.read().decode("utf-8")
                 #print(resp.reason, ', ', body) #TODO
@@ -175,38 +178,45 @@ class SimpleAiProvider:
     #外部调用此函数即可调用简单聊天功能
     #message: 如果是文本，则使用各项默认参数
     #传入 list/dict 可以定制 role 等参数
-    #返回 (respTxt, host)
+    #返回 respTxt，如果要获取当前使用的主机，可以使用 host 属性
     def chat(self, message) -> (str, str):
         if not self.apiKey:
             raise ValueError(f'The api key is empty')
         name = self.name
         if name == "openai":
-            ret = self._openai_chat(message)
+            return self._openai_chat(message)
         elif name == "anthropic":
-            ret = self._anthropic_chat(message)
+            return self._anthropic_chat(message)
         elif name == "google":
-            ret = self._gemini_chat(message)
+            return self._google_chat(message)
         elif name == "xai":
-            ret = self._grok_chat(message)
+            return self._xai_chat(message)
         elif name == "mistral":
-            ret = self._mistral_chat(message)
+            return self._mistral_chat(message)
         elif name == 'groq':
-            ret = self._groq_chat(message)
+            return self._groq_chat(message)
         elif name == 'perplexity':
-            ret = self._perplexity_chat(message)
+            return self._perplexity_chat(message)
         elif name == "alibaba":
-            ret = self._alibaba_chat(message)
+            return self._alibaba_chat(message)
         else:
             raise ValueError(f"Unsupported provider: {name}")
 
-        return ret, self.host
+    #返回当前服务提供商支持的models列表
+    def models(self, prebuild=True):
+        if self.name in ('openai', 'xai'):
+            return self._openai_models()
+        elif self.name == 'google':
+            return self._google_models()
+        else:
+            return [item['name'] for item in self._models]
 
     #openai的chat接口
-    def _openai_chat(self, message, path='/v1/chat/completions'):
+    def _openai_chat(self, message, path='v1/chat/completions'):
         headers = {'Authorization': f'Bearer {self.apiKey}', 'Content-Type': 'application/json'}
         if isinstance(message, str):
             msg = [{"role": "user", "content": message}]
-        elif self.singleTurn: #将多轮对话手动拼接为单一轮对话
+        elif self.singleTurn and (len(message) > 1): #将多轮对话手动拼接为单一轮对话
             msgArr = ['Previous conversions:\n']
             roleMap = {'system': 'background', 'assistant': 'Your responsed'}
             msgArr.extend([f'{roleMap.get(e["role"], "I asked")}:\n{e["content"]}\n' for e in message[:-1]])
@@ -218,8 +228,14 @@ class SimpleAiProvider:
         else:
             msg = message
         payload = {"model": self.model, "messages": msg}
-        data = self.post(path, payload, headers)
+        data = self._send(path, payload, headers, method='POST')
         return data["choices"][0]["message"]["content"]
+
+    #openai的models接口
+    def _openai_models(self):
+        headers = {'Authorization': f'Bearer {self.apiKey}', 'Content-Type': 'application/json'}
+        data = self._send('v1/models', headers=headers, method='GET')
+        return [item['id'] for item in data['data']]
 
     #anthropic的chat接口
     def _anthropic_chat(self, message):
@@ -240,12 +256,12 @@ class SimpleAiProvider:
             prompt = f"\n\nHuman: {message}\n\nAssistant:"
             payload = {"prompt": prompt, "model": self.model, "max_tokens_to_sample": 256}
         
-        data = self.post('/v1/complete', payload, headers)
+        data = self._send('v1/complete', payload, headers, method='POST')
         return data["completion"]
 
-    #gemini的chat接口
-    def _gemini_chat(self, message):
-        url = f'/v1beta/models/{self.model}:generateContent?key={self.apiKey}'
+    #google的chat接口
+    def _google_chat(self, message):
+        url = f'v1beta/models/{self.model}:generateContent?key={self.apiKey}'
         headers = {'Content-Type': 'application/json'}
         if isinstance(message, list): #将openai的payload格式转换为gemini的格式
             msg = []
@@ -258,29 +274,37 @@ class SimpleAiProvider:
             payload = message
         else:
             payload = {'contents': [{'role': 'user', 'parts': [{'text': message}]}]}
-        data = self.post(url, payload, headers)
+        data = self._send(url, payload, headers, method='POST')
         contents = data["candidates"][0]["content"]
         return contents['parts'][0]['text']
 
-    #grok的chat接口
-    def _grok_chat(self, message):
-        return self._openai_chat(message, path='/v1/chat/completions')
+    #google的models接口
+    def _google_models(self):
+        url = f'v1beta/models:generateContent?key={self.apiKey}&pageSize=100'
+        headers = {'Content-Type': 'application/json'}
+        data = self._send(url, headers=headers, method='GET')
+        _trim = lambda x: x[7:] if x.startswith('models/') else x
+        return [_trim(item['name']) for item in data['models']]
+
+    #xai的chat接口
+    def _xai_chat(self, message):
+        return self._openai_chat(message, path='v1/chat/completions')
 
     #mistral的chat接口
     def _mistral_chat(self, message):
-        return self._openai_chat(message, path='/v1/chat/completions')
+        return self._openai_chat(message, path='v1/chat/completions')
 
     #groq的chat接口
     def _groq_chat(self, message):
-        return self._openai_chat(message, path='/openai/v1/chat/completions')
+        return self._openai_chat(message, path='openai/v1/chat/completions')
 
     #perplexity的chat接口
     def _perplexity_chat(self, message):
-        return self._openai_chat(message, path='/chat/completions')
+        return self._openai_chat(message, path='chat/completions')
 
     #通义千问
     def _alibaba_chat(self, message):
-        return self._openai_chat(message, path='/compatible-mode/v1/chat/completions')
+        return self._openai_chat(message, path='compatible-mode/v1/chat/completions')
 
 #duckduckgo转openai格式的封装器，外部接口兼容http.HTTPConnection
 class DuckOpenAi:
