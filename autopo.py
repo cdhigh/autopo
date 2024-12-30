@@ -11,13 +11,12 @@ appDir = os.path.dirname(os.path.abspath(__file__))
 CONFIG_JSON = os.path.join(appDir, 'config.json')
 BATCH_SIZE = 2000   #每次翻译的字节数量
 
-SYS_PROMPT = """You are a renowned translation expert in fields '{}', translate the text in a professional and elegant manner without sounding like a machine translation.
+SYS_PROMPT = """You are a renowned translation expert{fields}, translate the text in a professional and elegant manner without sounding like a machine translation.
 
 Your primary focus is to deliver translations following these guidelines:
 
-- Return in a valid JSON dictionary format only, with no extra content.
 - Only translate the text and not interpret it further.
-- Do not translate format placeholders like {{}}, {{0}}, {{name}}, %s, %(name)s, etc.
+- Do not translate format placeholders like {{}}, {{0}}, {{{{id_0}}}}, {{name}}, %s, %(name)s, etc.
 - Do not translate HTML tag names like <br/> etc.
 - If original text has only one word, translate it as a single word.
 - The translation must preserve the original line breaks and leading/trailing spaces.
@@ -26,7 +25,7 @@ Your primary focus is to deliver translations following these guidelines:
 - Focus solely on delivering precise, concise, friendly, semantically accurate translations."""
 
 TR_PROMPT = """I will provide a JSON dictionary below.
-Please translate the keys from {src} to {dst} and replace the original dictionary values with the translations for the corresponding keys, without modifying the dictionary keys.
+Please translate the keys from the source language ({src}) to the target language ({dst}) and replace the original dictionary values with the translations for the corresponding keys, without modifying the dictionary keys.
 If a key has only one word, translate it as a single word.
 Return the fully translated valid JSON dictionary in the same structure, without any explanations or additional comments.
 
@@ -35,12 +34,20 @@ JSON dictionary:
 """
 
 TR_REF_PROMPT = """I will provide a JSON dictionary below.
-Please translate the keys from {src} to {dst} and replace the original dictionary values with the translations for the corresponding keys, without modifying the dictionary keys.
+Please translate the keys from the source language ({src}) to the target language ({dst}) and replace the original dictionary values with the translations for the corresponding keys, without modifying the dictionary keys.
 The original values (if present) in the dictionary are {refLang} translations of the keys, provided as a reference to help you translate them more accurately. Replace the values with your translations.
 Return the fully translated valid JSON dictionary in the same structure, without any explanations or additional comments.
 
 JSON dictionary:
 {text}"""
+
+TR_PH_PROMPT = """I will provide some text below.
+Please translate them from the source language ({src}) to the target language ({dst}).
+Return the translated text in the same structure, without any explanations or additional comments.
+
+Text block:
+{text}
+"""
 
 #常见语种的代码对应表，不在这个表中的直接使用语言代码，AI识别也不会有任何问题，不会影响翻译
 LANGUAGE_CODES = {"en": "English", "zh": "Chinese", "zh_cn": "Simplified Chinese",
@@ -87,7 +94,8 @@ def createAiAgent(cfgFile=None):
 #fuzzify: 是否标识刚翻译的词条为fuzzy
 #excluded: 需要排除的翻译文本列表
 #fields: 为了让AI更准确的翻译，提供材料所在领域，为一个字符串列表
-def translateFile(fileName, agent, dstLang, srcLang=None, outFile=None, refPoFile='', refLang=None, fuzzify=False, excluded=None, fields=None):
+def translateFile(fileName, agent, dstLang, srcLang=None, outFile=None, refPoFile='', 
+    refLang=None, fuzzify=False, excluded=None, fields=None):
     print(f'{LANGUAGE_CODES.get(dstLang, dstLang)}: translating by {str(agent)}')
     srcLang = srcLang or 'en'
     outFile = outFile or fileName
@@ -132,6 +140,8 @@ def translateFile(fileName, agent, dstLang, srcLang=None, outFile=None, refPoFil
             totalCnt += cnt
 
     if totalCnt:
+        for e in po.obsolete_entries():
+            po.remove(e)
         po.save(outFile)
         po = polib.pofile(outFile) #重新读取一次
 
@@ -148,10 +158,35 @@ def translateFile(fileName, agent, dstLang, srcLang=None, outFile=None, refPoFil
 #返回已经翻译的条目数量
 def translateBatch(agent, batch, dstLang, srcLang, refLang, objDic, fuzzify=False, fields=None, **kwages):
     print(f'  Translating a batch: {len(batch)}')
-    fields = fields or ['Computer', 'Technology']
-    msg = [{"role": "system", "content": SYS_PROMPT.format('/'.join(fields))},
+    ret = translateJson(agent, batch, dstLang, srcLang, refLang, fields)
+    cnt = 0
+    for k, v in ret.items():
+        if not k:
+            print('  Found a empty key')
+            continue
+        elif not v:
+            print(f'  Found a empty value for key in translated: {k}')
+            continue
+        elif entry := objDic.get(k):
+            entry.msgstr = v
+            entry.fuzzy = fuzzify
+            cnt += 1
+        else:
+            print(f'  The key in translated is modified? {k}')
+    return cnt
+
+#使用json方法翻译一个字典
+#agent: SimpleAiProvider实例
+#dic: 要翻译的字典，键为待翻译字符串
+#dstLang/srcLang: 目标语言代码/源语言
+#refLang: 参考翻译文本的语种，如果存在的话
+#fields: 为了让AI更准确的翻译，提供材料所在领域，为一个字符串列表
+#返回翻译后的字典
+def translateJson(agent, dic, dstLang, srcLang, refLang=None, fields=None):
+    fields = ' in fields "{}"'.format('/'.join(fields)) if fields else ''
+    msg = [{"role": "system", "content": SYS_PROMPT.format(fields=fields)},
         {"role": "user", "content": ''}]
-    text = json.dumps(batch, separators=(',', ':'), ensure_ascii=False)
+    text = json.dumps(dic, separators=(',', ':'), ensure_ascii=False)
     src = LANGUAGE_CODES.get(srcLang, srcLang)
     dst = LANGUAGE_CODES.get(dstLang, dstLang)
     refLang = LANGUAGE_CODES.get(refLang, refLang)
@@ -172,11 +207,11 @@ def translateBatch(agent, batch, dstLang, srcLang, refLang, objDic, fuzzify=Fals
             time.sleep(interval)
         except Exception as e:
             print(f'Error again: {str(e)}, breaking')
-            return 0
+            return {}
 
     if not respTxt:
         print('Response is empty, breaking')
-        return 0
+        return {}
 
     #处理这一批次的翻译结果
     #print(respTxt) #TODO
@@ -187,26 +222,65 @@ def translateBatch(agent, batch, dstLang, srcLang, refLang, objDic, fuzzify=Fals
         respTxt = respTxt[startBraces:endBraces + 1]
 
     try:
-        ret = json.loads(respTxt)
+        return json.loads(respTxt)
     except:
         print('  Received json is invalid: \n{}\n'.format(respTxt[:100]))
-        return 0
+        return {}
 
-    cnt = 0
-    for k, v in ret.items():
-        if not k:
-            print('  Found a empty key')
-            continue
-        elif not v:
-            print(f'  Found a empty value for key in translated: {k}')
-            continue
-        elif entry := objDic.get(k):
-            entry.msgstr = v
-            entry.fuzzy = fuzzify
-            cnt += 1
-        else:
-            print(f'  The key in translated is modified? {k}')
-    return cnt
+#使用占位符方法翻译一个字典
+#agent: SimpleAiProvider实例
+#dic: 要翻译的字典，键为待翻译字符串，值为空
+#dstLang/srcLang: 目标语言代码/源语言
+#refLang: 参考翻译文本的语种，如果存在的话
+#fields: 为了让AI更准确的翻译，提供材料所在领域，为一个字符串列表
+#返回翻译后的字典
+def translateByPlaceholder(agent, dic, dstLang, srcLang, fields=None):
+    fields = ' in fields "{}"'.format('/'.join(fields)) if fields else ''
+    msg = [{"role": "system", "content": SYS_PROMPT.format(fields=fields)},
+        {"role": "user", "content": ''}]
+    
+    #构建翻译字符串，每一段使用占位符标识
+    hldMap = {}
+    textArr = []
+    for idx, item in enumerate(dic):
+        hldMap[idx] = item
+        textArr.append(f'{{{{id_{idx}}}}}\n{item}')
+    text = '\n\n'.join(textArr)
+    
+    src = LANGUAGE_CODES.get(srcLang, srcLang)
+    dst = LANGUAGE_CODES.get(dstLang, dstLang)
+    msg[1]['content'] = TR_PH_PROMPT.format(text=text, src=src, dst=dst)
+    
+    interval = (60 / agent.rpm) if (agent.rpm > 0) else 20 #两次请求直接的间隔
+    try:
+        respTxt = agent.chat(msg)
+        time.sleep(interval)
+    except Exception as e:
+        print(f'Error: {str(e)}, retrying')
+        time.sleep(interval + 30)
+        try:
+            respTxt = agent.chat(msg) #再失败就直接退出
+            time.sleep(interval)
+        except Exception as e:
+            print(f'Error again: {str(e)}, breaking')
+            return {}
+
+    if not respTxt:
+        print('Response is empty, breaking')
+        return {}
+
+    #处理这一批次的翻译结果
+    #print(respTxt) #TODO
+    #根据占位符，提取翻译字符串
+    pat = r'{{\s*id\s*_\s*(\d+)\s*}}(.*?)(?={{\s*id\s*_\s*\d+\s*}}|$)'
+    matches = re.findall(pat, respTxt, re.DOTALL)
+    ret = {}
+    for match in matches:
+        item = hldMap.get(int(match[0]))
+        tred = match[1].strip()
+        if item and tred and tred != item:
+            ret[item] = tred
+    return ret
 
 #分析命令行参数
 def getArg():

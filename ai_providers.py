@@ -7,13 +7,16 @@ import http.client
 from urllib.parse import urlsplit
 
 #支持的AI服务商列表，models里面的第一项请设置为默认要使用的model
+#context: 输入上下文长度，因为程序采用估计法，建议设小一些。注意：一般的AI的输出长度较短，大约4k/8k
 #rpm(requests per minute)是针对免费用户的，如果是付费用户，一般会高很多，可以自己修改
 #大语言模型发展迅速，估计没多久这些数据会全部过时
 AI_LIST = {
     'google': {'host': 'https://generativelanguage.googleapis.com', 'models': [
-        {'name': 'gemini-1.5-flash', 'rpm': 15, 'context': 128000}, #其实支持100万
-        {'name': 'gemini-1.5-flash-8b', 'rpm': 15, 'context': 128000}, 
-        {'name': 'gemini-1.5-pro', 'rpm': 2, 'context': 128000},],},
+        {'name': 'gemini-1.5-flash', 'rpm': 60, 'context': 128000}, #其实支持100万
+        {'name': 'gemini-1.5-flash-8b', 'rpm': 60, 'context': 128000},
+        {'name': 'gemini-1.5-pro', 'rpm': 10, 'context': 128000},
+        {'name': 'gemini-2.0-flash-exp', 'rpm': 10, 'context': 128000},
+        {'name': 'gemini-2.0-flash-thinking-exp', 'rpm': 10, 'context': 128000},],},
     'openai': {'host': 'https://api.openai.com', 'models': [
         {'name': 'gpt-4o-mini', 'rpm': 3, 'context': 128000},
         {'name': 'gpt-4o', 'rpm': 3, 'context': 128000},
@@ -63,6 +66,7 @@ class HttpResponseError(Exception):
 
 class SimpleAiProvider:
     #name: AI提供商的名字
+    #apiKey: 如需要多个Key，以分号分割，逐个使用
     #apiHost: 支持自搭建的API转发服务器，传入以分号分割的地址列表字符串，则逐个使用
     #singleTurn: 一些API转发服务不支持多轮对话模式，设置此标识，当前仅支持 openai
     def __init__(self, name, apiKey, model=None, apiHost=None, singleTurn=False):
@@ -70,7 +74,8 @@ class SimpleAiProvider:
         if name not in AI_LIST:
             raise ValueError(f"Unsupported provider: {name}")
         self.name = name
-        self.apiKey = apiKey
+        self.apiKeys = apiKey.split(';')
+        self.apiKeyIdx = 0
         self.singleTurn = singleTurn
         self._models = AI_LIST[name]['models']
         
@@ -91,13 +96,18 @@ class SimpleAiProvider:
         self.connIdx = 0
         self.createConnections()
 
+    #自动获取下一个ApiKey
+    @property
+    def apiKey(self):
+        ret = self.apiKeys[self.apiKeyIdx]
+        self.apiKeyIdx = (self.apiKeyIdx + 1) % len(self.apiKeys)
+        return ret
+
     #自动获取列表中下一个连接对象，返回 (index, host tuple, con obj)
     def nextConnection(self):
         index = self.connIdx
-        self.connIdx += 1
-        if self.connIdx >= len(self.connPools):
-            self.connIdx = 0
         host, conn = self.connPools[index]
+        self.connIdx = (self.connIdx + 1) % len(self.connPools)
         return index, host, conn
 
     #创建长连接
@@ -129,9 +139,9 @@ class SimpleAiProvider:
         self.connPools[index][1] = conn
 
     #发起一个网络请求，返回json数据
-    def _send(self, path, payload, headers, toJson=True, method='POST') -> dict:
-        #print(f'payload={payload}')
-        #print(f'headers={headers}')
+    def _send(self, path, headers=None, payload=None, toJson=True, method='POST') -> dict:
+        if payload:
+            payload = json.dumps(payload)
         retried = 0
         while retried < 2:
             try:
@@ -139,13 +149,11 @@ class SimpleAiProvider:
                 self.host = host.netloc
                 #拼接路径，避免一些边界条件出错
                 url = '/' + host.path.strip('/') + (('?' + host.query) if host.query else '') + path.lstrip('/')
-                if method == 'POST':
-                    conn.request('POST', url, json.dumps(payload), headers)
-                else:
-                    conn.request('GET', url, headers=headers)
+                conn.request(method, url, payload, headers)
                 resp = conn.getresponse()
                 body = resp.read().decode("utf-8")
                 #print(resp.reason, ', ', body) #TODO
+                print(url)
                 if not (200 <= resp.status < 300):
                     raise HttpResponseError(resp.status, resp.reason, body)
                 return json.loads(body) if toJson else body
@@ -228,13 +236,13 @@ class SimpleAiProvider:
         else:
             msg = message
         payload = {"model": self.model, "messages": msg}
-        data = self._send(path, payload, headers, method='POST')
+        data = self._send(path, headers=headers, payload=payload, method='POST')
         return data["choices"][0]["message"]["content"]
 
     #openai的models接口
     def _openai_models(self):
         headers = {'Authorization': f'Bearer {self.apiKey}', 'Content-Type': 'application/json'}
-        data = self._send('v1/models', headers=headers, method='GET')
+        data = self._send('v1/models', headers=headers, payload=None, method='GET')
         return [item['id'] for item in data['data']]
 
     #anthropic的chat接口
@@ -256,7 +264,7 @@ class SimpleAiProvider:
             prompt = f"\n\nHuman: {message}\n\nAssistant:"
             payload = {"prompt": prompt, "model": self.model, "max_tokens_to_sample": 256}
         
-        data = self._send('v1/complete', payload, headers, method='POST')
+        data = self._send('v1/complete', payload=payload, headers=headers, method='POST')
         return data["completion"]
 
     #google的chat接口
@@ -274,15 +282,15 @@ class SimpleAiProvider:
             payload = message
         else:
             payload = {'contents': [{'role': 'user', 'parts': [{'text': message}]}]}
-        data = self._send(url, payload, headers, method='POST')
+        data = self._send(url, payload=payload, headers=headers, method='POST')
         contents = data["candidates"][0]["content"]
         return contents['parts'][0]['text']
 
     #google的models接口
     def _google_models(self):
-        url = f'v1beta/models:generateContent?key={self.apiKey}&pageSize=100'
+        url = f'v1beta/models?key={self.apiKey}&pageSize=100'
         headers = {'Content-Type': 'application/json'}
-        data = self._send(url, headers=headers, method='GET')
+        data = self._send(url, payload=None, headers=headers, method='GET')
         _trim = lambda x: x[7:] if x.startswith('models/') else x
         return [_trim(item['name']) for item in data['models']]
 
@@ -356,13 +364,13 @@ class DuckOpenAi:
 
     #使用底层接口实际发送网络请求
     #返回元祖 (status, headers, body)
-    def _send(self, url, heads, payload=None, method='GET'):
+    def _send(self, url, headers=None, payload=None, method='GET'):
         retried = 0
-        headers = self.HEADERS
-        headers.update(heads)
+        _headers = self.HEADERS
+        _headers.update(headers)
         while retried < 2:
             try:
-                self.conn.request(method, url, payload, headers)
+                self.conn.request(method, url, payload, _headers)
                 resp = self.conn.getresponse()
                 return resp.status, resp.headers, resp.read()
             except (http.client.CannotSendRequest, http.client.RemoteDisconnected) as e:
@@ -379,14 +387,15 @@ class DuckOpenAi:
 
     #发起请求，返回 DuckResponse 实例
     def getresponse(self):
-        status, heads, body = self._send(self.STATUS_URL, {"x-vqd-accept": "1"})
+        status, heads, body = self._send(self.STATUS_URL, headers={"x-vqd-accept": "1"})
         if status != 200:
             return self.DuckResponse(status, heads, body)
             
         vqd4 = heads.get("x-vqd-4", '')
         payload = {"model": "gpt-4o-mini", "messages": self._payload.get('messages', [])}
 
-        status, heads, body = self._send(self.CHAT_URL, {"x-vqd-4": vqd4}, json.dumps(payload), 'POST')
+        status, heads, body = self._send(self.CHAT_URL, headers={"x-vqd-4": vqd4}, 
+            payload=json.dumps(payload), method='POST')
         if status != 200:
             return self.DuckResponse(status, heads, body)
 
@@ -409,4 +418,3 @@ class DuckOpenAi:
             "choices": [{ "index": 0, "finish_reason": "stop",
                 "message": {"role": "assistant", "content": content},},],}
         return self.DuckResponse(status, heads, json.dumps(body).encode('utf-8'))
-
