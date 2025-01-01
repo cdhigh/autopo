@@ -82,10 +82,10 @@ class SimpleAiProvider:
         #如果传入的model不在列表中，默认使用第一个
         item = next((m for m in self._models if m['name'] == model), self._models[0])
         self.model = item['name']
-        self.rpm = item['rpm']
+        self._rpm = item['rpm']
         self.context_size = item['context']
-        if self.rpm <= 0:
-            self.rpm = 2
+        if self._rpm <= 0:
+            self._rpm = 2
         if self.context_size < 1000:
             self.context_size = 1000
         #分析主机和url，保存为 SplitResult(scheme,netloc,path,query,frament)元祖
@@ -95,6 +95,11 @@ class SimpleAiProvider:
         self.host = '' #当前正在使用的 netloc
         self.connIdx = 0
         self.createConnections()
+
+    #返回速率限制，如果有多个host或key，则速率可以倍数放大
+    @property
+    def rpm(self):
+        return int(self._rpm * max([len(self.connPools), len(self.apiKeys)]))
 
     #自动获取下一个ApiKey
     @property
@@ -153,7 +158,6 @@ class SimpleAiProvider:
                 resp = conn.getresponse()
                 body = resp.read().decode("utf-8")
                 #print(resp.reason, ', ', body) #TODO
-                print(url)
                 if not (200 <= resp.status < 300):
                     raise HttpResponseError(resp.status, resp.reason, body)
                 return json.loads(body) if toJson else body

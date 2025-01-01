@@ -19,7 +19,7 @@ Your primary focus is to deliver translations following these guidelines:
 - Do not translate format placeholders like {{}}, {{0}}, {{{{id_0}}}}, {{name}}, %s, %(name)s, etc.
 - Do not translate HTML tag names like <br/> etc.
 - If original text has only one word, translate it as a single word.
-- The translation must preserve the original line breaks and leading/trailing spaces.
+- The translation must preserve the original markdown formats, line breaks and leading/trailing spaces.
 - The translation should have a length in bytes that is as close as possible to the original, being shorter if needed, but never longer than the original by a considerable amount.
 - If necessary, English abbreviations can be retained without translation.
 - Focus solely on delivering precise, concise, friendly, semantically accurate translations."""
@@ -256,13 +256,13 @@ def translateByPlaceholder(agent, dic, dstLang, srcLang, fields=None):
         respTxt = agent.chat(msg)
         time.sleep(interval)
     except Exception as e:
-        print(f'Error: {str(e)}, retrying')
+        print(f'Error [{agent.host}]: {str(e)}, retrying')
         time.sleep(interval + 30)
         try:
             respTxt = agent.chat(msg) #再失败就直接退出
             time.sleep(interval)
         except Exception as e:
-            print(f'Error again: {str(e)}, breaking')
+            print(f'Error again [{agent.host}]: {str(e)}, breaking')
             return {}
 
     if not respTxt:
